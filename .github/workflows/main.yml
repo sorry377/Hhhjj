@@ -26,8 +26,6 @@ jobs:
             echo "ไม่พบไฟล์ .zip ที่ root ของ repo"
             exit 1
           fi
-          echo "ไฟล์หลังแตก zip:"
-          find _src -not -path '*/__MACOSX*' | head -50
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -49,6 +47,9 @@ jobs:
           fi
           dir=$(dirname "$f")
           echo "โปรเจกต์อยู่ที่: $dir"
+          if ! grep -qs "android.useAndroidX" "$dir/gradle.properties"; then
+            printf 'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\nandroid.useAndroidX=true\nandroid.nonTransitiveRClass=true\nkotlin.code.style=official\n' >> "$dir/gradle.properties"
+          fi
           gradle -p "$dir" :app:assembleDebug --no-daemon
           mkdir -p out
           cp "$dir/app/build/outputs/apk/debug/app-debug.apk" out/app-debug.apk
