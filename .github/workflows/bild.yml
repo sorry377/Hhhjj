@@ -1,0 +1,116 @@
+name: Build APK from uploaded ZIP
+
+# วิธีใช้:
+# 1. ไปที่ Actions → Build APK from uploaded ZIP → Run workflow
+# 2. อัปโหลดไฟล์ project.zip (zip ทั้งโฟลเดอร์ WorldBoxModLoader)
+# 3. Workflow จะแตก zip แล้ว build APK ให้อัตโนมัติ
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'Optional note'
+        required: false
+        default: 'build from zip'
+
+jobs:
+  build-from-zip:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create workspace
+        run: mkdir -p project
+
+      - name: Download project zip artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: project-source
+          path: project
+        continue-on-error: true
+
+      - name: Check if zip exists in repo
+        id: check_zip
+        run: |
+          if [ -f project-source.zip ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            unzip -o project-source.zip -d project
+          elif [ -f WorldBoxModLoader.zip ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            unzip -o WorldBoxModLoader.zip -d project
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "No zip found in root. Will try to use checked out source."
+          fi
+
+      - name: Checkout fallback
+        if: steps.check_zip.outputs.found != 'true'
+        uses: actions/checkout@v4
+        with:
+          path: project
+
+      - name: Show structure
+        run: |
+          echo "=== Project structure ==="
+          find project -maxdepth 3 -type d | head -50
+          ls -la project
+
+      - name: Locate real project root
+        id: root
+        run: |
+          # หา settings.gradle.kts หรือ build.gradle.kts
+          ROOT=$(find project -name "settings.gradle.kts" -o -name "settings.gradle" | head -1 | xargs dirname)
+          if [ -z "$ROOT" ]; then
+            ROOT=$(find project -name "build.gradle.kts" -o -name "build.gradle" | head -1 | xargs dirname)
+          fi
+          if [ -z "$ROOT" ]; then
+            ROOT=project
+          fi
+          echo "project_root=$ROOT" >> $GITHUB_OUTPUT
+          echo "Using project root: $ROOT"
+          ls -la "$ROOT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Create gradlew if missing
+        working-directory: ${{ steps.root.outputs.project_root }}
+        run: |
+          if [ ! -f gradlew ]; then
+            gradle wrapper --gradle-version 8.5 || true
+          fi
+          chmod +x gradlew || true
+          # fallback: use system gradle
+          if [ ! -f gradlew ]; then
+            echo "gradlew still missing, will use gradle command"
+          fi
+
+      - name: Build Debug APK
+        working-directory: ${{ steps.root.outputs.project_root }}
+        run: |
+          if [ -f gradlew ]; then
+            ./gradlew assembleDebug --stacktrace
+          else
+            gradle assembleDebug --stacktrace
+          fi
+
+      - name: Find and upload APK
+        run: |
+          echo "=== Looking for APK ==="
+          find ${{ steps.root.outputs.project_root }} -name "*.apk" -type f
+          mkdir -p out
+          find ${{ steps.root.outputs.project_root }} -name "*.apk" -type f -exec cp {} out/ \;
+          ls -la out/
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorldBoxModLoader-APK
+          path: out/*.apk
+          if-no-files-found: warn
+          
