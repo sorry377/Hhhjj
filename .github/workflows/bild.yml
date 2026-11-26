@@ -1,73 +1,71 @@
-name: Build APK from uploaded ZIP
-
-# วิธีใช้:
-# 1. ไปที่ Actions → Build APK from uploaded ZIP → Run workflow
-# 2. อัปโหลดไฟล์ project.zip (zip ทั้งโฟลเดอร์ WorldBoxModLoader)
-# 3. Workflow จะแตก zip แล้ว build APK ให้อัตโนมัติ
+name: Build APK from ZIP (scan all)
 
 on:
+  push:
+    paths:
+      - '**.zip'
+      - '.github/workflows/build-from-zip.yml'
   workflow_dispatch:
     inputs:
-      note:
-        description: 'Optional note'
+      build_type:
+        description: 'debug หรือ release'
         required: false
-        default: 'build from zip'
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+
+permissions:
+  contents: read
 
 jobs:
-  build-from-zip:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      - name: Create workspace
-        run: mkdir -p project
-
-      - name: Download project zip artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: project-source
-          path: project
-        continue-on-error: true
-
-      - name: Check if zip exists in repo
-        id: check_zip
-        run: |
-          if [ -f project-source.zip ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
-            unzip -o project-source.zip -d project
-          elif [ -f WorldBoxModLoader.zip ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
-            unzip -o WorldBoxModLoader.zip -d project
-          else
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "No zip found in root. Will try to use checked out source."
-          fi
-
-      - name: Checkout fallback
-        if: steps.check_zip.outputs.found != 'true'
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          path: project
 
-      - name: Show structure
+      - name: Scan repo for zips and Gradle projects
+        id: scan
         run: |
-          echo "=== Project structure ==="
-          find project -maxdepth 3 -type d | head -50
-          ls -la project
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/work"
+          rm -rf "$WORK" && mkdir -p "$WORK"
+          ROOTS="$RUNNER_TEMP/roots.txt"
+          : > "$ROOTS"
 
-      - name: Locate real project root
-        id: root
-        run: |
-          # หา settings.gradle.kts หรือ build.gradle.kts
-          ROOT=$(find project -name "settings.gradle.kts" -o -name "settings.gradle" | head -1 | xargs dirname)
-          if [ -z "$ROOT" ]; then
-            ROOT=$(find project -name "build.gradle.kts" -o -name "build.gradle" | head -1 | xargs dirname)
+          echo "=== ZIP files in repo ==="
+          find . -path ./.git -prune -o -type f -name '*.zip' -print | sort > "$RUNNER_TEMP/zips.txt"
+          cat "$RUNNER_TEMP/zips.txt" || true
+
+          # แตกทุก zip ที่เจอ ลงโฟลเดอร์แยกของแต่ละไฟล์
+          while IFS= read -r z; do
+            [ -z "$z" ] && continue
+            dest="$WORK/$(basename "$z" .zip)"
+            mkdir -p "$dest"
+            echo "Unzipping $z -> $dest"
+            unzip -q -o "$z" -d "$dest" || echo "::warning::unzip failed: $z"
+          done < "$RUNNER_TEMP/zips.txt"
+
+          # สแกนหา settings.gradle(.kts) ทั้งใน repo และในที่แตกแล้ว
+          ( find . "$WORK" -path ./.git -prune -o -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -print \
+              | grep -vE '/(build|\.gradle)/' || true ) > "$RUNNER_TEMP/settings.txt"
+
+          while IFS= read -r s; do
+            [ -z "$s" ] && continue
+            (cd "$(dirname "$s")" && pwd -P) >> "$ROOTS"
+          done < "$RUNNER_TEMP/settings.txt"
+          sort -u "$ROOTS" -o "$ROOTS"
+
+          echo "=== Gradle project roots ==="
+          cat "$ROOTS"
+          if [ ! -s "$ROOTS" ]; then
+            echo "::error::ไม่พบโปรเจกต์ Gradle (settings.gradle) ทั้งใน repo และใน zip"
+            exit 1
           fi
-          if [ -z "$ROOT" ]; then
-            ROOT=project
-          fi
-          echo "project_root=$ROOT" >> $GITHUB_OUTPUT
-          echo "Using project root: $ROOT"
-          ls -la "$ROOT"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -78,39 +76,55 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Create gradlew if missing
-        working-directory: ${{ steps.root.outputs.project_root }}
-        run: |
-          if [ ! -f gradlew ]; then
-            gradle wrapper --gradle-version 8.5 || true
-          fi
-          chmod +x gradlew || true
-          # fallback: use system gradle
-          if [ ! -f gradlew ]; then
-            echo "gradlew still missing, will use gradle command"
-          fi
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
 
-      - name: Build Debug APK
-        working-directory: ${{ steps.root.outputs.project_root }}
+      - name: Build every project found
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type || 'debug' }}
         run: |
-          if [ -f gradlew ]; then
-            ./gradlew assembleDebug --stacktrace
-          else
-            gradle assembleDebug --stacktrace
-          fi
+          set -uo pipefail
+          ROOTS="$RUNNER_TEMP/roots.txt"
+          OUT="$GITHUB_WORKSPACE/apk-out"
+          mkdir -p "$OUT"
 
-      - name: Find and upload APK
-        run: |
-          echo "=== Looking for APK ==="
-          find ${{ steps.root.outputs.project_root }} -name "*.apk" -type f
-          mkdir -p out
-          find ${{ steps.root.outputs.project_root }} -name "*.apk" -type f -exec cp {} out/ \;
-          ls -la out/
+          if [ "$BUILD_TYPE" = "release" ]; then TASK="assembleRelease"; else TASK="assembleDebug"; fi
+          echo "Task: $TASK"
 
-      - name: Upload APK artifact
+          BUILT=0; FAILED=0; IDX=0
+          while IFS= read -r root; do
+            [ -z "$root" ] && continue
+            IDX=$((IDX + 1))
+            echo "::group::[$IDX] Building $root"
+            cd "$root"
+
+            if [ ! -f gradlew ]; then
+              echo "gradlew missing — generating wrapper"
+              gradle wrapper --gradle-version 8.5
+            fi
+            chmod +x gradlew
+
+            if ./gradlew "$TASK" --stacktrace --no-daemon; then
+              BUILT=$((BUILT + 1))
+              find . -type f -name '*.apk' -path '*/build/outputs/apk/*' | while IFS= read -r apk; do
+                cp -v "$apk" "$OUT/$(printf '%02d' "$IDX")_$(basename "$root")_$(basename "$apk")"
+              done
+            else
+              FAILED=$((FAILED + 1))
+              echo "::warning::Build failed: $root"
+            fi
+
+            cd "$GITHUB_WORKSPACE"
+            echo "::endgroup::"
+          done < "$ROOTS"
+
+          echo "=== Summary: built=$BUILT failed=$FAILED ==="
+          ls -la "$OUT"
+          [ "$BUILT" -gt 0 ] || { echo "::error::ไม่มี APK ที่ build สำเร็จเลย"; exit 1; }
+
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
           name: WorldBoxModLoader-APK
-          path: out/*.apk
-          if-no-files-found: warn
-          
+          path: apk-out/*.apk
+          if-no-files-found: error
