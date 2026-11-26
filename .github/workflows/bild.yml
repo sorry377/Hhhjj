@@ -104,20 +104,81 @@ jobs:
           if [ "$BUILD_TYPE" = "release" ]; then TASK="assembleRelease"; else TASK="assembleDebug"; fi
           echo "Task: $TASK"
 
+          # เลือกเวอร์ชัน Gradle: ใช้ของโปรเจกต์ก่อน ไม่มีก็เดาจากเวอร์ชัน AGP
+          pick_gradle() {
+            local props=gradle/wrapper/gradle-wrapper.properties v agp
+            if [ -f "$props" ]; then
+              v=$(sed -nE 's#.*gradle-([0-9][0-9.]*)(-rc-[0-9]+)?-(bin|all)\.zip.*#\1#p' "$props" | head -1)
+              if [ -n "$v" ]; then echo "$v"; return; fi
+            fi
+            agp=$( { grep -rhoE --include='*.gradle' --include='*.gradle.kts' --include='*.toml' \
+                      --exclude-dir=build --exclude-dir=.gradle \
+                      -e "com\.android\.(application|library)[\"']?\)?[[:space:]]*version[[:space:]]*\(?[\"']?[0-9]+\.[0-9]+" \
+                      -e "com\.android\.tools\.build:gradle:[0-9]+\.[0-9]+" \
+                      -e "^agp[[:space:]]*=[[:space:]]*\"[0-9]+\.[0-9]+" . 2>/dev/null || true; } \
+                    | grep -oE '[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+            case "$agp" in
+              9.*)            echo "9.1.0" ;;
+              8.13|8.12|8.11) echo "8.13" ;;
+              8.10|8.9)       echo "8.11.1" ;;
+              8.8)            echo "8.10.2" ;;
+              8.7)            echo "8.9" ;;
+              8.6|8.5)        echo "8.7" ;;
+              8.4)            echo "8.6" ;;
+              8.3)            echo "8.4" ;;
+              8.2)            echo "8.2" ;;
+              8.1|8.0)        echo "8.0" ;;
+              *)              echo "8.10.2" ;;
+            esac
+          }
+
+          # สร้าง gradle wrapper ในโฟลเดอร์ว่างก่อน แล้วค่อยก็อปเข้าโปรเจกต์
+          # (กัน gradle ของ runner มาอ่านโปรเจกต์แล้วพังเพราะเวอร์ชันไม่เข้ากัน)
+          make_wrapper() {
+            local ver="$1" tmp
+            tmp="$(mktemp -d)"
+            ( cd "$tmp" && gradle wrapper --gradle-version "$ver" --no-daemon -q ) || return 1
+            mkdir -p gradle/wrapper
+            cp "$tmp/gradlew" "$tmp/gradlew.bat" .
+            cp "$tmp/gradle/wrapper/"* gradle/wrapper/
+            chmod +x gradlew
+          }
+
           BUILT=0; FAILED=0; IDX=0
           while IFS= read -r root; do
             [ -z "$root" ] && continue
             IDX=$((IDX + 1))
-            echo "::group::[$IDX] Building $root"
             cd "$root"
+            LOG="$RUNNER_TEMP/build_$IDX.log"
 
-            if [ ! -f gradlew ]; then
-              echo "gradlew missing — generating wrapper"
-              gradle wrapper --gradle-version 8.5
+            GV="$(pick_gradle)"
+            CANDIDATES="$GV"
+            # ถ้าโปรเจกต์ไม่ได้กำหนด Gradle เอง ให้ลองเวอร์ชันสำรองถ้าอันแรกพัง
+            if [ ! -f gradle/wrapper/gradle-wrapper.properties ]; then
+              for alt in 8.10.2 8.13; do
+                [ "$alt" != "$GV" ] && CANDIDATES="$CANDIDATES $alt"
+              done
             fi
-            chmod +x gradlew
 
-            if ./gradlew "$TASK" --stacktrace --no-daemon; then
+            OK=0
+            for ver in $CANDIDATES; do
+              echo "::group::[$IDX] $root — Gradle $ver"
+              if [ ! -f gradlew ] || [ ! -f gradle/wrapper/gradle-wrapper.jar ] || ! grep -q "gradle-$ver-" gradle/wrapper/gradle-wrapper.properties 2>/dev/null; then
+                make_wrapper "$ver" || { echo "::endgroup::"; echo "::warning::สร้าง wrapper $ver ไม่สำเร็จ"; continue; }
+              fi
+              ./gradlew "$TASK" --stacktrace --no-daemon --console=plain 2>&1 | tee "$LOG"
+              rc=${PIPESTATUS[0]}
+              echo "::endgroup::"
+              if [ "$rc" -eq 0 ]; then OK=1; break; fi
+
+              echo "=========== สาเหตุที่ build พัง (Gradle $ver) ==========="
+              grep -n -A12 "What went wrong" "$LOG" | head -40 || true
+              echo "--- Caused by ---"
+              grep -E "^Caused by:" "$LOG" | sort -u | head -10 || true
+              echo "========================================================"
+            done
+
+            if [ "$OK" -eq 1 ]; then
               BUILT=$((BUILT + 1))
               find . -type f -name '*.apk' -path '*/build/outputs/apk/*' | while IFS= read -r apk; do
                 cp -v "$apk" "$OUT/$(printf '%02d' "$IDX")_$(basename "$root")_$(basename "$apk")"
@@ -128,7 +189,6 @@ jobs:
             fi
 
             cd "$GITHUB_WORKSPACE"
-            echo "::endgroup::"
           done < "$ROOTS"
 
           echo "=== Summary: built=$BUILT failed=$FAILED ==="
